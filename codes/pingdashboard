@@ -1,0 +1,490 @@
+import os from "os"
+import axios from "axios"
+import { performance } from "perf_hooks"
+import { execSync } from "child_process"
+import { createCanvas } from "canvas"
+
+// ---------- helpers ----------
+function ensureRoundRect(ctx) {
+  if (typeof ctx.roundRect === "function") return
+  ctx.roundRect = function (x, y, w, h, r) {
+    const radius = typeof r === "number" ? { tl: r, tr: r, br: r, bl: r } : r
+    this.beginPath()
+    this.moveTo(x + radius.tl, y)
+    this.lineTo(x + w - radius.tr, y)
+    this.quadraticCurveTo(x + w, y, x + w, y + radius.tr)
+    this.lineTo(x + w, y + h - radius.br)
+    this.quadraticCurveTo(x + w, y + h, x + w - radius.br, y + h)
+    this.lineTo(x + radius.bl, y + h)
+    this.quadraticCurveTo(x, y + h, x, y + h - radius.bl)
+    this.lineTo(x, y + radius.tl)
+    this.quadraticCurveTo(x, y, x + radius.tl, y)
+    this.closePath()
+    return this
+  }
+}
+
+function size(b) {
+  const s = ["B", "KB", "MB", "GB", "TB"]
+  const i = Math.floor(Math.log(b || 1) / Math.log(1024))
+  return `${(b / Math.pow(1024, i)).toFixed(2)} ${s[i]}`
+}
+
+function fmtTime(sec) {
+  const d = Math.floor(sec / 86400)
+  const h = Math.floor((sec % 86400) / 3600)
+  const m = Math.floor((sec % 3600) / 60)
+  return `${d}d ${h}h ${m}m`
+}
+
+function getDiskUsageLinux() {
+  // df -B1 / | tail -1
+  const df = execSync("df -B1 / | tail -1").toString().trim().split(/\s+/)
+  const total = parseInt(df[1] || "0")
+  const used = parseInt(df[2] || "0")
+  const pct = parseInt(String(df[4] || "0").replace("%", ""))
+  return { total, used, pct: isNaN(pct) ? 0 : pct }
+}
+
+function getDiskUsageFallback() {
+  return { total: 0, used: 0, pct: 0 }
+}
+
+async function httpPing(url) {
+  const started = performance.now()
+  try {
+    // HEAD dulu biar ringan, fallback GET kalau ditolak
+    await axios.head(url, { timeout: 15000, validateStatus: () => true })
+    const ms = performance.now() - started
+    return { ok: true, ms }
+  } catch {
+    try {
+      await axios.get(url, { timeout: 15000, validateStatus: () => true })
+      const ms = performance.now() - started
+      return { ok: true, ms }
+    } catch (e) {
+      return { ok: false, ms: performance.now() - started, err: e?.message || String(e) }
+    }
+  }
+}
+
+async function runSpeedTest() {
+  let downloadSpeed = 0
+  let uploadSpeed = 0
+
+  try {
+    // Download ~5MB (lebih ringan dari 10MB)
+    const dlStart = performance.now()
+    const dlRes = await axios.get("https://speed.cloudflare.com/__down?bytes=5000000", {
+      responseType: "arraybuffer",
+      timeout: 20000,
+      headers: { "User-Agent": "Mozilla/5.0" }
+    })
+    const dlTime = (performance.now() - dlStart) / 1000
+    downloadSpeed = dlRes.data.byteLength / (dlTime || 1)
+  } catch {
+    downloadSpeed = 0
+  }
+
+  try {
+    // Upload ~512KB (lebih aman)
+    const upData = "0".repeat(512 * 1024)
+    const upStart = performance.now()
+    await axios.post("https://speed.cloudflare.com/__up", upData, {
+      headers: { "Content-Length": upData.length },
+      timeout: 20000
+    })
+    const upTime = (performance.now() - upStart) / 1000
+    uploadSpeed = upData.length / (upTime || 1)
+  } catch {
+    uploadSpeed = 0
+  }
+
+  const format = (bytesPerSec) => {
+    const mbps = (bytesPerSec * 8) / (1024 * 1024)
+    return mbps >= 1 ? `${mbps.toFixed(2)} Mbps` : `${(mbps * 1000).toFixed(2)} Kbps`
+  }
+
+  return { dl: format(downloadSpeed), ul: format(uploadSpeed) }
+}
+
+function buildDashboardImage(stats) {
+  const {
+    cpuPercent,
+    cpuCores,
+    cpuName,
+    cpuSpeed,
+    memPercent,
+    usedMem,
+    totalMem,
+    freeMem,
+    diskPercent,
+    diskUsed,
+    latency,
+    netStats,
+    botUptime,
+    serverUptime,
+    httpTarget
+  } = stats
+
+  const W = 1280
+  const H = 720
+  const canvas = createCanvas(W, H)
+  const ctx = canvas.getContext("2d")
+  ensureRoundRect(ctx)
+
+  const C = {
+    bg: "#0b0f19",
+    card: "#111625",
+    stroke: "#1f293a",
+    text: "#ffffff",
+    subtext: "#7d8590",
+    blue: "#3b82f6",
+    green: "#10b981",
+    purple: "#8b5cf6",
+    cyan: "#06b6d4"
+  }
+
+  function box(x, y, w, h, radius = 10) {
+    ctx.beginPath()
+    ctx.roundRect(x, y, w, h, radius)
+    ctx.fillStyle = C.card
+    ctx.fill()
+    ctx.strokeStyle = C.stroke
+    ctx.lineWidth = 2
+    ctx.stroke()
+  }
+
+  function circleGraph(x, y, r, pct, color, label, sub) {
+    ctx.beginPath()
+    ctx.arc(x, y, r, 0, Math.PI * 2)
+    ctx.strokeStyle = C.stroke
+    ctx.lineWidth = 12
+    ctx.stroke()
+
+    ctx.beginPath()
+    const start = -Math.PI / 2
+    const end = start + Math.PI * 2 * (pct / 100)
+    ctx.arc(x, y, r, start, end)
+    ctx.strokeStyle = color
+    ctx.lineWidth = 12
+    ctx.lineCap = "round"
+    ctx.shadowBlur = 15
+    ctx.shadowColor = color
+    ctx.stroke()
+    ctx.shadowBlur = 0
+
+    ctx.textAlign = "center"
+    ctx.fillStyle = C.text
+    ctx.font = "bold 28px sans-serif"
+    ctx.fillText(`${pct}%`, x, y + 8)
+
+    ctx.fillStyle = C.subtext
+    ctx.font = "bold 14px sans-serif"
+    ctx.fillText(label, x, y + r + 30)
+    ctx.fillStyle = color
+    ctx.font = "12px sans-serif"
+    ctx.fillText(sub, x, y + r + 50)
+    ctx.textAlign = "left"
+  }
+
+  function barGraph(x, y, w, h, pct, color, label) {
+    ctx.fillStyle = C.subtext
+    ctx.font = "12px sans-serif"
+    ctx.fillText(label, x, y - 8)
+
+    ctx.textAlign = "right"
+    ctx.fillText(`${pct}%`, x + w, y - 8)
+    ctx.textAlign = "left"
+
+    ctx.beginPath()
+    ctx.roundRect(x, y, w, h, h / 2)
+    ctx.fillStyle = C.stroke
+    ctx.fill()
+
+    const fillW = Math.max(10, w * (pct / 100))
+    ctx.beginPath()
+    ctx.roundRect(x, y, fillW, h, h / 2)
+    ctx.fillStyle = color
+    ctx.shadowBlur = 10
+    ctx.shadowColor = color
+    ctx.fill()
+    ctx.shadowBlur = 0
+  }
+
+  // BG
+  ctx.fillStyle = C.bg
+  ctx.fillRect(0, 0, W, H)
+
+  // Header
+  ctx.fillStyle = C.cyan
+  ctx.font = "bold 24px sans-serif"
+  ctx.fillText("⚡ SYSTEM MONITOR", 40, 50)
+  ctx.fillStyle = C.subtext
+  ctx.font = "16px sans-serif"
+  ctx.fillText("Real-Time Performance Dashboard", 40, 75)
+
+  // Latency
+  ctx.textAlign = "right"
+  ctx.fillStyle = C.green
+  ctx.font = "bold 20px sans-serif"
+  ctx.fillText(`${latency.toFixed(2)}ms`, W - 40, 50)
+  ctx.fillStyle = C.subtext
+  ctx.font = "12px sans-serif"
+  ctx.fillText("LATENCY", W - 40, 70)
+  ctx.textAlign = "left"
+
+  // Row 1
+  const boxY = 110
+  const boxW = 280
+  const boxH = 220
+  const gap = 26
+
+  box(40, boxY, boxW, boxH)
+  circleGraph(40 + boxW / 2, boxY + 90, 55, cpuPercent, C.blue, "CPU USAGE", `${cpuCores} Cores`)
+
+  box(40 + boxW + gap, boxY, boxW, boxH)
+  circleGraph(40 + boxW + gap + boxW / 2, boxY + 90, 55, memPercent, C.green, "MEMORY", size(usedMem))
+
+  box(40 + (boxW + gap) * 2, boxY, boxW, boxH)
+  circleGraph(40 + (boxW + gap) * 2 + boxW / 2, boxY + 90, 55, diskPercent, C.purple, "STORAGE", size(diskUsed))
+
+  const netX = 40 + (boxW + gap) * 3
+  box(netX, boxY, boxW, boxH)
+  ctx.fillStyle = C.cyan
+  ctx.font = "bold 18px sans-serif"
+  ctx.fillText("NETWORK SPEED", netX + 20, boxY + 40)
+
+  ctx.fillStyle = C.subtext
+  ctx.font = "14px sans-serif"
+  ctx.fillText("⬇ Download", netX + 20, boxY + 90)
+  ctx.fillStyle = C.text
+  ctx.font = "bold 22px sans-serif"
+  ctx.fillText(netStats?.dl || "-", netX + 20, boxY + 115)
+
+  ctx.fillStyle = C.subtext
+  ctx.font = "14px sans-serif"
+  ctx.fillText("⬆ Upload", netX + 20, boxY + 160)
+  ctx.fillStyle = C.text
+  ctx.font = "bold 22px sans-serif"
+  ctx.fillText(netStats?.ul || "-", netX + 20, boxY + 185)
+
+  // Row 2 pills
+  const pillY = 360
+  const pillH = 60
+  const pills = [
+    { l: "HOSTNAME", v: os.hostname(), c: C.blue },
+    { l: "PLATFORM", v: `${os.platform()} (${os.arch()})`, c: C.green },
+    { l: "BOT UPTIME", v: botUptime, c: C.purple },
+    { l: "SERVER UP", v: serverUptime, c: C.cyan },
+    { l: "NODEJS", v: process.version, c: C.blue }
+  ]
+  const pillW = (W - 80 - gap * (pills.length - 1)) / pills.length
+
+  pills.forEach((p, i) => {
+    const px = 40 + (pillW + gap) * i
+    box(px, pillY, pillW, pillH, 8)
+
+    ctx.beginPath()
+    ctx.arc(px + 20, pillY + 30, 4, 0, Math.PI * 2)
+    ctx.fillStyle = p.c
+    ctx.fill()
+
+    ctx.fillStyle = C.subtext
+    ctx.font = "10px sans-serif"
+    ctx.fillText(p.l, px + 35, pillY + 22)
+
+    ctx.fillStyle = C.text
+    ctx.font = "bold 14px sans-serif"
+    ctx.fillText(p.v, px + 35, pillY + 45)
+  })
+
+  // Row 3 performance
+  const perfY = 450
+  const perfH = 230
+  box(40, perfY, W - 80, perfH)
+
+  ctx.fillStyle = C.text
+  ctx.font = "bold 18px sans-serif"
+  ctx.fillText("SYSTEM PERFORMANCE", 70, perfY + 40)
+  ctx.fillStyle = C.subtext
+  ctx.font = "14px sans-serif"
+  ctx.fillText("Real-time resource monitoring", 70, perfY + 60)
+
+  const barX = 70
+  const barStartY = perfY + 100
+  const barW2 = 500
+
+  barGraph(barX, barStartY, barW2, 10, cpuPercent, C.blue, "CPU Load")
+  barGraph(barX, barStartY + 40, barW2, 10, memPercent, C.green, "Memory Usage")
+  barGraph(barX, barStartY + 80, barW2, 10, diskPercent, C.purple, "Disk Usage")
+
+  // latency bar (0-1000ms => 0-100%)
+  const latPct = Math.min((latency / 1000) * 100, 100)
+  barGraph(barX, barStartY + 120, barW2, 10, Math.round(latPct), C.cyan, "System Latency")
+
+  // info
+  const infoX = 700
+  const infoY = perfY + 100
+
+  const details = [
+    { k: "OS Release", v: os.release() },
+    { k: "CPU Model", v: cpuName },
+    { k: "CPU Speed", v: cpuSpeed },
+    { k: "Total Memory", v: size(totalMem) },
+    { k: "Free Memory", v: size(freeMem) },
+    { k: "HTTP Target", v: httpTarget || "-" }
+  ]
+
+  details.forEach((d, i) => {
+    const dy = infoY + i * 25
+    ctx.fillStyle = C.subtext
+    ctx.font = "14px sans-serif"
+    ctx.fillText(d.k, infoX, dy)
+
+    ctx.fillStyle = C.text
+    ctx.font = "bold 14px sans-serif"
+    ctx.fillText(d.v, infoX + 200, dy)
+  })
+
+  ctx.textAlign = "center"
+  ctx.fillStyle = C.subtext
+  ctx.font = "italic 12px sans-serif"
+  ctx.fillText(`Dashboard Generated: ${new Date().toLocaleString()}`, W / 2, H - 15)
+
+  return canvas.toBuffer("image/png")
+}
+
+function calcLocalLatencyMs() {
+  // lebih meaningful: event loop delay via perf_hooks
+  const t0 = performance.now()
+  return performance.now() - t0
+}
+
+function getCpuPercent() {
+  // loadavg/cores (cepat & ringan)
+  const cores = os.cpus()?.length || 1
+  const load = os.loadavg?.()[0] ?? 0
+  return Math.max(0, Math.min(100, Math.floor((load / cores) * 100)))
+}
+
+// ---------- plugin ----------
+export default {
+  name: "ping",
+  command: ["ping"],
+  tags: ["main"],
+  run: async (ev, rt) => {
+    const m = ev.m
+    const q = String(ev.q || "").trim()
+
+    const wantImg = q === "img" || q === "image"
+    const wantFull = q === "full"
+    const maybeUrl = (!wantImg && !wantFull && q) ? q : ""
+
+    // reply cepat dulu
+    await m.react("⏳").catch(() => {})
+    if (!wantImg && !wantFull) {
+      await m.reply("⚡ Checking status...").catch(() => {})
+    }
+
+    // http ping ke target (optional)
+    let httpInfo = null
+    if (maybeUrl) {
+      const url = /^https?:\/\//i.test(maybeUrl) ? maybeUrl : `https://${maybeUrl}`
+      httpInfo = await httpPing(url)
+      httpInfo.url = url
+    }
+
+    // net speed (optional)
+    const netStats = wantFull ? await runSpeedTest() : { dl: "-", ul: "-" }
+
+    // cpu/mem
+    const cpus = os.cpus()
+    const cpuName = (cpus?.[0]?.model || "Unknown CPU").split(" @")[0].trim()
+    const cpuSpeed = (cpus?.[0]?.speed || 0) + " MHz"
+    const cpuCores = cpus?.length || 1
+    const cpuPercent = getCpuPercent()
+
+    const totalMem = os.totalmem()
+    const freeMem = os.freemem()
+    const usedMem = totalMem - freeMem
+    const memPercent = totalMem ? Math.round((usedMem / totalMem) * 100) : 0
+
+    // disk
+    let diskTotal = 0, diskUsed = 0, diskPercent = 0
+    try {
+      const d = getDiskUsageLinux()
+      diskTotal = d.total
+      diskUsed = d.used
+      diskPercent = d.pct
+    } catch {
+      const d = getDiskUsageFallback()
+      diskTotal = d.total
+      diskUsed = d.used
+      diskPercent = d.pct
+    }
+
+    // uptime
+    const botUptime = fmtTime(process.uptime())
+    const serverUptime = fmtTime(os.uptime())
+
+    // latency simple
+    const latency = calcLocalLatencyMs()
+
+    // mode gambar
+    if (wantImg || wantFull) {
+      const img = buildDashboardImage({
+        cpuPercent,
+        cpuCores,
+        cpuName,
+        cpuSpeed,
+        memPercent,
+        usedMem,
+        totalMem,
+        freeMem,
+        diskPercent,
+        diskUsed,
+        diskTotal,
+        latency,
+        netStats,
+        botUptime,
+        serverUptime,
+        httpTarget: httpInfo ? `${httpInfo.url} (${httpInfo.ok ? httpInfo.ms.toFixed(0) + "ms" : "ERR"})` : ""
+      })
+
+      await rt.sock.sendMessage(
+        m.chat,
+        { image: img, caption: "📊 *Ping / System Monitor*" },
+        { quoted: m.raw }
+      )
+
+      await m.react("✅").catch(() => {})
+      return
+    }
+
+    // mode teks (default)
+    const lines = []
+    lines.push("✅ *PONG*")
+    lines.push(`• Bot Uptime: *${botUptime}*`)
+    lines.push(`• Server Up : *${serverUptime}*`)
+    lines.push(`• CPU       : *${cpuPercent}%* (${cpuCores} cores)`)
+    lines.push(`• RAM       : *${memPercent}%* (${size(usedMem)} / ${size(totalMem)})`)
+    lines.push(`• Disk      : *${diskPercent}%* (${size(diskUsed)} / ${size(diskTotal)})`)
+    lines.push(`• Latency   : *${latency.toFixed(2)}ms*`)
+
+    if (httpInfo) {
+      lines.push(`• HTTP Ping : *${httpInfo.ok ? httpInfo.ms.toFixed(0) + "ms" : "ERROR"}*`)
+      lines.push(`• Target    : ${httpInfo.url}`)
+      if (!httpInfo.ok && httpInfo.err) lines.push(`• Err       : ${httpInfo.err}`)
+    }
+
+    lines.push("")
+    lines.push("Mode:")
+    lines.push("• `.ping img`  (dashboard)")
+    lines.push("• `.ping full` (dashboard + speedtest)")
+    lines.push("• `.ping <url>` (cek panel/domain)")
+
+    await m.reply(lines.join("\n")).catch(() => {})
+    await m.react("✅").catch(() => {})
+  }
+}
