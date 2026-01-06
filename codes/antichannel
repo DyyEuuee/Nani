@@ -1,0 +1,102 @@
+📄 *GET PLUGIN*
+🧩 Name: antiChannel
+
+import { jidNormalizedUser, getUserKey, unwrapMessage } from "../../lib/helper.js"
+
+export default {
+  name: "antiChannel",
+  tags: ["group"],
+  command: ["antich"],
+  groupOnly: true,
+  middleware: async ({ m, rt }) => {
+    const { sock, db } = rt
+    const chat = m.chat
+    
+    if (!chat || !String(chat).endsWith("@g.us")) return
+    const g = db.getGroup(chat)
+    if (!g?.antiLinkCh) return 
+
+    const msg = m.raw?.message
+    if (!msg) return
+    const root = unwrapMessage(msg)
+    const ctx =
+      root?.extendedTextMessage?.contextInfo ||
+      root?.imageMessage?.contextInfo ||
+      root?.videoMessage?.contextInfo ||
+      root?.documentMessage?.contextInfo ||
+      root?.stickerMessage?.contextInfo ||
+      root?.messageContextInfo ||
+      null
+    const isNewsletter = !!ctx?.forwardedNewsletterMessageInfo
+
+    if (!isNewsletter) return
+    const isOwner = (rt.config.owner || []).some(o => m.sender.includes(o))
+    if (isOwner) return
+    let participants = []
+    try {
+      const meta = await sock.groupMetadata(chat)
+      participants = meta?.participants || []
+    } catch (e) {
+      console.error("[AntiCh] Gagal fetch metadata:", e)
+      return 
+    }
+
+    const senderKey = getUserKey(m.sender)
+    
+    const senderIsAdmin = participants.some(p => {
+      const role = String(p.admin ?? "").toLowerCase()
+      const ok = role === "admin" || role === "superadmin" || p.admin === true
+      const pId = getUserKey(p.id || p.jid)
+      return ok && pId === senderKey
+    })
+
+    if (senderIsAdmin) {
+      console.log(`[AntiCh] Skip hapus: ${m.sender} adalah admin.`)
+      return
+    }
+    try {
+      await sock.sendMessage(chat, { delete: m.raw.key })
+      console.log(`[AntiCh] Sukses hapus pesan channel dari ${m.sender}`)
+    } catch (e) {
+      console.error(`[AntiCh] Gagal hapus pesan (Bot bukan admin?):`, e)
+    }
+  },
+
+  run: async (ev, rt) => {
+    const { m, args, isOwner } = ev
+    const { sock, db } = rt 
+
+    const chat = m.chat
+    const metadata = await sock.groupMetadata(chat)
+    const participants = metadata?.participants || []
+    const senderKey = getUserKey(m.sender)
+
+    const isAdmin = participants.some(p => {
+      const role = String(p.admin ?? "").toLowerCase()
+      const ok = role === "admin" || role === "superadmin" || p.admin === true
+      const pId = getUserKey(p.id || p.jid)
+      return ok && pId === senderKey
+    })
+
+    if (!isAdmin && !isOwner) return m.reply("Khusus Admin Grup!")
+
+    const g = db.getGroup(chat)
+    const input = args[0] ? args[0].toLowerCase() : ""
+
+    if (["on", "1", "enable"].includes(input)) {
+      g.antiLinkCh = true
+      await db.save()
+      return m.reply("✅ Anti-Forward Channel: *ON*")
+    }
+
+    if (["off", "0", "disable"].includes(input)) {
+      g.antiLinkCh = false
+      await db.save()
+      return m.reply("✅ Anti-Forward Channel: *OFF*")
+    }
+
+    return m.reply(`Status Anti-Channel: *${g.antiLinkCh ? "ON" : "OFF"}*\n\nGunakan:\n.antich on\n.antich off`)
+  }
+}
+
+//~dyysomnia
